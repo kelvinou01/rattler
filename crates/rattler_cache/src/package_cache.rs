@@ -10,6 +10,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use async_trait::async_trait;
 use fxhash::FxHashMap;
 use itertools::Itertools;
 use parking_lot::Mutex;
@@ -23,6 +24,64 @@ use tracing::Instrument;
 use url::Url;
 
 use crate::validation::validate_package_directory;
+
+/// A [`PackageCache`] manages a cache of extracted Conda packages on disk.
+///
+/// The store does not provide an implementation to get the data into the store.
+/// Instead this is left up to the user when the package is requested. If the
+/// package is found in the cache it is returned immediately. However, if the
+/// cache is stale a user defined function is called to populate the cache. This
+/// separates the corners between caching and fetching of the content.
+#[async_trait]
+pub trait PackageCache {
+    /// Returns the directory that contains the specified package.
+    ///
+    /// If the package was previously successfully fetched and stored in the
+    /// cache the directory containing the data is returned immediately. If
+    /// the package was not previously fetched the filesystem is checked to
+    /// see if a directory with valid package content exists. Otherwise, the
+    /// user provided `fetch` function is called to populate the cache.
+    async fn get_or_fetch<F, Fut, E>(
+        &self,
+        pkg: impl Into<CacheKey> + Send,
+        fetch: F,
+        reporter: Option<Arc<dyn CacheReporter>>,
+    ) -> Result<PathBuf, PackageCacheError>
+    where
+        F: (FnOnce(PathBuf) -> Fut) + Send + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static;
+
+    /// Returns the directory that contains the specified package.
+    ///
+    /// This is a convenience wrapper around `get_or_fetch` which fetches the
+    /// package from the given URL if the package could not be found in the
+    /// cache.
+    async fn get_or_fetch_from_url(
+        &self,
+        pkg: impl Into<CacheKey> + Send,
+        url: Url,
+        client: reqwest_middleware::ClientWithMiddleware,
+        reporter: Option<Arc<dyn CacheReporter>>,
+    ) -> Result<PathBuf, PackageCacheError> {
+        self.get_or_fetch_from_url_with_retry(pkg, url, client, DoNotRetryPolicy, reporter)
+            .await
+    }
+
+    /// Returns the directory that contains the specified package.
+    ///
+    /// This is a convenience wrapper around `get_or_fetch` which fetches the
+    /// package from the given URL if the package could not be found in the
+    /// cache.
+    async fn get_or_fetch_from_url_with_retry(
+        &self,
+        pkg: impl Into<CacheKey> + Send,
+        url: Url,
+        client: reqwest_middleware::ClientWithMiddleware,
+        retry_policy: impl RetryPolicy + Send + 'static,
+        reporter: Option<Arc<dyn CacheReporter>>,
+    ) -> Result<PathBuf, PackageCacheError>;
+}
 
 /// A trait that can be implemented to report progress of the download and
 /// validation process.
@@ -39,15 +98,21 @@ pub trait CacheReporter: Send + Sync {
     fn on_download_completed(&self, index: usize);
 }
 
-/// A [`PackageCache`] manages a cache of extracted Conda packages on disk.
+/// An error that might be returned from one of the caching function of the
+/// [`PackageCache`].
 ///
-/// The store does not provide an implementation to get the data into the store.
-/// Instead this is left up to the user when the package is requested. If the
-/// package is found in the cache it is returned immediately. However, if the
-/// cache is stale a user defined function is called to populate the cache. This
-/// separates the corners between caching and fetching of the content.
+/// This list is intended to grow over time and it is not recommended to
+/// exhaustively match against it.
+#[non_exhaustive]
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum PackageCacheError {
+    /// An error occurred while fetching the package.
+    #[error(transparent)]
+    FetchError(#[from] Arc<dyn std::error::Error + Send + Sync + 'static>),
+}
+
 #[derive(Clone)]
-pub struct PackageCache {
+pub struct SingletonPackageCache {
     inner: Arc<Mutex<PackageCacheInner>>,
 }
 
@@ -123,46 +188,18 @@ struct Package {
     inflight: Option<broadcast::Sender<Result<PathBuf, PackageCacheError>>>,
 }
 
-/// An error that might be returned from one of the caching function of the
-/// [`PackageCache`].
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum PackageCacheError {
-    /// An error occurred while fetching the package.
-    #[error(transparent)]
-    FetchError(#[from] Arc<dyn std::error::Error + Send + Sync + 'static>),
-}
-
-impl PackageCache {
-    /// Constructs a new [`PackageCache`] located at the specified path.
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(PackageCacheInner {
-                path: path.into(),
-                packages: FxHashMap::default(),
-            })),
-        }
-    }
-
-    /// Returns the directory that contains the specified package.
-    ///
-    /// If the package was previously successfully fetched and stored in the
-    /// cache the directory containing the data is returned immediately. If
-    /// the package was not previously fetch the filesystem is checked to
-    /// see if a directory with valid package content exists. Otherwise, the
-    /// user provided `fetch` function is called to populate the cache.
-    ///
-    /// If the package is already being fetched by another task/thread the
-    /// request is coalesced. No duplicate fetch is performed.
-    pub async fn get_or_fetch<F, Fut, E>(
+#[async_trait]
+impl PackageCache for SingletonPackageCache {
+    async fn get_or_fetch<F, Fut, E>(
         &self,
-        pkg: impl Into<CacheKey>,
+        pkg: impl Into<CacheKey> + Send,
         fetch: F,
         reporter: Option<Arc<dyn CacheReporter>>,
     ) -> Result<PathBuf, PackageCacheError>
     where
         F: (FnOnce(PathBuf) -> Fut) + Send + 'static,
         Fut: Future<Output = Result<(), E>> + Send + 'static,
-        E: std::error::Error + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
     {
         let cache_key = pkg.into();
 
@@ -223,30 +260,9 @@ impl PackageCache {
         rx.recv().await.expect("in-flight request has died")
     }
 
-    /// Returns the directory that contains the specified package.
-    ///
-    /// This is a convenience wrapper around `get_or_fetch` which fetches the
-    /// package from the given URL if the package could not be found in the
-    /// cache.
-    pub async fn get_or_fetch_from_url(
+    async fn get_or_fetch_from_url_with_retry(
         &self,
-        pkg: impl Into<CacheKey>,
-        url: Url,
-        client: reqwest_middleware::ClientWithMiddleware,
-        reporter: Option<Arc<dyn CacheReporter>>,
-    ) -> Result<PathBuf, PackageCacheError> {
-        self.get_or_fetch_from_url_with_retry(pkg, url, client, DoNotRetryPolicy, reporter)
-            .await
-    }
-
-    /// Returns the directory that contains the specified package.
-    ///
-    /// This is a convenience wrapper around `get_or_fetch` which fetches the
-    /// package from the given URL if the package could not be found in the
-    /// cache.
-    pub async fn get_or_fetch_from_url_with_retry(
-        &self,
-        pkg: impl Into<CacheKey>,
+        pkg: impl Into<CacheKey> + Send,
         url: Url,
         client: reqwest_middleware::ClientWithMiddleware,
         retry_policy: impl RetryPolicy + Send + 'static,
@@ -312,6 +328,18 @@ impl PackageCache {
             }
         }, reporter)
         .await
+    }
+}
+
+impl SingletonPackageCache {
+    /// Constructs a new [`PackageCache`] located at the specified path.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(PackageCacheInner {
+                path: path.into(),
+                packages: FxHashMap::default(),
+            })),
+        }
     }
 }
 
@@ -430,7 +458,7 @@ mod test {
     use tokio_stream::StreamExt;
     use url::Url;
 
-    use super::PackageCache;
+    use super::{SingletonPackageCache, PackageCache};
     use crate::validation::validate_package_directory;
 
     fn get_test_data_dir() -> PathBuf {
@@ -452,10 +480,9 @@ mod test {
                 .find(|entry| entry.path().unwrap().as_ref() == Path::new("info/paths.json"))
                 .unwrap();
             PathsJson::from_reader(paths_entry).unwrap()
-        };
 
         let packages_dir = tempdir().unwrap();
-        let cache = PackageCache::new(packages_dir.path());
+        let cache: Box<dyn PackageCache> = Box::new(SingletonPackageCache::new(packages_dir.path()));
 
         // Get the package to the cache
         let package_dir = cache
@@ -590,7 +617,7 @@ mod test {
         tokio::spawn(axum::serve(listener, service).into_future());
 
         let packages_dir = tempdir().unwrap();
-        let cache = PackageCache::new(packages_dir.path());
+        let cache = SingletonPackageCache::new(packages_dir.path());
 
         let server_url = Url::parse(&format!("http://localhost:{}", addr.port())).unwrap();
 

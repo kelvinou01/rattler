@@ -26,6 +26,7 @@ url.workspace = true
 thiserror.workspace = true
 reqwest-middleware.workspace = true
 digest.workspace = true
+async-trait = "0.1.82"
 
 [dev-dependencies]
 assert_matches.workspace = true
